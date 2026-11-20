@@ -1,0 +1,23 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -320,6 +320,19 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			p->width = sweet_dict_u32(pd, "IOSurfacePlaneWidth", s->width);
+ 			p->height = sweet_dict_u32(pd, "IOSurfacePlaneHeight", s->height);
+ 			p->bytesPerElement = (uint16_t)sweet_dict_u32(pd, "IOSurfacePlaneBytesPerElement", 1);
++#if defined(DREAMLTE)
++			/*
++			 * Galaxy S8: SpringBoard creates 'b3a8' surfaces (30-bit colour in
++			 * plane 0, 8-bit alpha in plane 1) with plane rows, offsets and sizes
++			 * but no IOSurfacePlaneBytesPerElement. The default of 1 told every
++			 * client that plane 0 has 1-byte pixels; the colour plane holds
++			 * 4-byte pixels (as IOSurfaceBytesPerElement says for the surface).
++			 */
++			if (pd->getObject("IOSurfacePlaneBytesPerElement") == NULL &&
++			    s->pixelFormat == 0x62336138 /* 'b3a8' */ && i == 0) {
++				p->bytesPerElement = 4;
++			}
++#endif
+ 			p->elementWidth = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementWidth", 1);
+ 			p->elementHeight = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementHeight", 1);
+ 			if (p->width > SWEET_SURFACE_MAX_DIM || p->height > SWEET_SURFACE_MAX_DIM ||
