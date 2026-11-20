@@ -1,0 +1,49 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -37,6 +37,9 @@
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSSymbol.h>
++#include <pexpert/arm64/board_config.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
+ 
+@@ -710,6 +713,35 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
++#if defined(DREAMLTE)
++		/*
++		 * Galaxy S8 diagnostic: multi-plane and wide-colour surfaces ('b3a8',
++		 * 'w30r') show up where iOS draws wrong colours. Log their keys and
++		 * the plane layout the clients will see.
++		 */
++		if (s->planeCount != 0 || s->pixelFormat != 0x42475241) {
++			OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
++			if (it != NULL) {
++				OSSymbol *k;
++				while ((k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++					OSNumber *n = OSDynamicCast(OSNumber, props->getObject(k));
++					IOLog("SWEET SURF:   id %u key %s = %s0x%llx\n", s->id, k->getCStringNoCopy(),
++					    n != NULL ? "" : "(not a number) ", n != NULL ? n->unsigned64BitValue() : 0ULL);
++				}
++				it->release();
++			}
++			OSArray *pi = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++			for (uint32_t i = 0; i < s->planeCount; i++) {
++				const struct sweet_surface_plane *pl = &s->planes[i];
++				OSDictionary *pd = pi != NULL ? OSDynamicCast(OSDictionary, pi->getObject(i)) : NULL;
++				IOLog("SWEET SURF:   id %u plane %u %ux%u bpe %u el %ux%u bpr %u%s off 0x%x%s size 0x%x%s\n",
++				    s->id, i, pl->width, pl->height, pl->bytesPerElement, pl->elementWidth, pl->elementHeight,
++				    pl->bytesPerRow, pd && pd->getObject("IOSurfacePlaneBytesPerRow") ? "" : " (ours)",
++				    pl->offset, pd && pd->getObject("IOSurfacePlaneOffset") ? "" : " (ours)",
++				    pl->size, pd && pd->getObject("IOSurfacePlaneSize") ? "" : " (ours)");
++			}
++		}
++#endif
+ 	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
