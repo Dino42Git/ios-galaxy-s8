@@ -1,0 +1,24 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -256,6 +256,20 @@
+ 	if (!native) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
++		/*
++		 * sweetfb_w/sweetfb_h: a smaller canvas for iOS to draw (e.g. the
++		 * iPhone XR's 828x1792 @2x, 46 % fewer pixels for CoreAnimation's
++		 * CPU renderer); the GPU still stretches it over the whole panel.
++		 * The ADT canvas and /product artwork scale must match (S8_CANVAS,
++		 * S8_ARTWORK in the boot image tools).
++		 */
++		uint32_t cw = 0, ch = 0;
++		if (PE_parse_boot_argn("sweetfb_w", &cw, sizeof(cw)) &&
++		    PE_parse_boot_argn("sweetfb_h", &ch, sizeof(ch)) &&
++		    cw >= 320 && cw <= fWidth && ch >= 480 && ch <= fHeight && (cw & 1) == 0) {
++			fLogicalW = cw;
++			fLogicalH = ch;
++		}
+ 	}
+ #elif !defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
