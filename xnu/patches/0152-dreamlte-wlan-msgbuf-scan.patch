@@ -1,0 +1,737 @@
+diff --git a/bsd/dev/s8_wlan.c b/bsd/dev/s8_wlan.c
+index 360c886..99b24f9 100644
+--- a/bsd/dev/s8_wlan.c
++++ b/bsd/dev/s8_wlan.c
+@@ -22,7 +22,18 @@
+  *              end of RAM through BAR2, the reset vector at TCM 0, the ARM
+  *              released; then waits for the firmware's shared-RAM address in
+  *              the last word of RAM. Firmware and NVRAM come from a local
+- *              s8_wlan_fw.h (Broadcom's binaries are not in this repository).
++ *              s8_wlan_fw.h, else from the ADT's /chosen "s8-wlan-fw" and
++ *              "s8-wlan-nvram" (tools/mkadt_dreamlte.py, S8_WLAN_FW and
++ *              S8_WLAN_NVRAM: Broadcom's binaries are not in this repository)
++ *   7  writes  the msgbuf protocol (brcmfmac pcie.c, msgbuf.c): host
++ *              capabilities, the five common rings and the scratch buffers in
++ *              physically contiguous memory, host ready; ioctl response and
++ *              event buffers posted; then reads the firmware's version string
++ *              and MAC address through ioctls; loads the CLM blob ("clmload",
++ *              ADT "s8-wlan-clm") when there is one
++ *   8  writes  interface up, then one active scan of all channels (iovar
++ *              "escan"): every network found is logged (SSID, BSSID,
++ *              channel, RSSI)
+  * Everything is polled, every step is logged before its first access.
+  */
+ #include <sys/param.h>
+@@ -33,6 +44,9 @@
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
+ #include <pexpert/arm64/board_config.h>
++#include <pexpert/device_tree.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
+ #if __has_include("s8_wlan_fw.h")
+ #include "s8_wlan_fw.h"
+ #define HAVE_WLAN_FW 1
+@@ -44,6 +58,9 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void IOSleep(unsigned int milliseconds);
+ extern kern_return_t thread_terminate(thread_t thread);
++extern ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
++extern void clean_dcache(vm_offset_t addr, unsigned count, int phys);
++extern void flush_dcache(vm_offset_t addr, unsigned count, int phys);
+ 
+ #define LOG(fmt, ...)   printf("S8WLAN: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -655,6 +672,45 @@ core_reset(struct bcm_core *c, uint32_t prereset, uint32_t reset, uint32_t postr
+ 
+ static uint32_t wlan_ramsize, wlan_shared;
+ 
++/* Firmware, NVRAM (already in the chip's form: "key=value" strings, NUL separated, then the length token) and CLM blob:
++ * built in, else the ADT's /chosen "s8-wlan-fw", "s8-wlan-nvram", "s8-wlan-clm". */
++static const uint8_t *wfw, *wnv, *wclm;
++static uint32_t wfw_len, wnv_len, wclm_len;
++
++static const uint8_t *
++adt_blob(DTEntry chosen, const char *name, uint32_t *len)
++{
++	void const *prop = NULL;
++	unsigned int size = 0;
++	if (chosen != NULL && SecureDTGetProperty(chosen, name, &prop, &size) == kSuccess && size >= 4) {
++		*len = size;
++		return (const uint8_t *)prop;
++	}
++	*len = 0;
++	return NULL;
++}
++
++static void
++fw_find(void)
++{
++	DTEntry chosen = NULL;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess) {
++		chosen = NULL;
++	}
++#if HAVE_WLAN_FW
++	wfw = s8_wlan_fw;
++	wfw_len = s8_wlan_fw_size;
++	wnv = s8_wlan_nvram;
++	wnv_len = s8_wlan_nvram_size;
++	LOG("6: firmware and NVRAM built in");
++#else
++	wfw = adt_blob(chosen, "s8-wlan-fw", &wfw_len);
++	wnv = adt_blob(chosen, "s8-wlan-nvram", &wnv_len);
++	LOG("6: firmware %u bytes, NVRAM %u bytes from the ADT", wfw_len, wnv_len);
++#endif
++	wclm = adt_blob(chosen, "s8-wlan-clm", &wclm_len);
++}
++
+ static int
+ step_firmware(void)
+ {
+@@ -682,31 +738,35 @@ step_firmware(void)
+ 		wlan_ramsize += ((info & 0x7f) + 1) * ((info & 0x200) ? 1024 : 8192);
+ 	}
+ 	LOG("6: ARM halted; TCM %u KiB (cap %#x, %u banks), rambase %#x", wlan_ramsize >> 10, cap, banks, WLAN_RAMBASE);
+-#if HAVE_WLAN_FW
++	fw_find();
++	if (wfw == NULL || wnv == NULL || (wfw_len & 3) || (wnv_len & 3)) {
++		LOG("6: no firmware/NVRAM (no s8_wlan_fw.h, no ADT /chosen s8-wlan-fw and s8-wlan-nvram)");
++		return ENOENT;
++	}
+ 	if (wlan_ramsize == 0 || WLAN_RAMBASE + wlan_ramsize > (BAR2_LIMIT - BAR2_CPU + 1) ||
+-	    s8_wlan_fw_size + s8_wlan_nvram_size > wlan_ramsize) {
++	    wfw_len + wnv_len > wlan_ramsize) {
+ 		LOG("6: RAM layout does not fit BAR2 (%u bytes)", wlan_ramsize);
+ 		return EFBIG;
+ 	}
+-	for (uint32_t o = 0; o < s8_wlan_fw_size; o += 4) {
++	for (uint32_t o = 0; o < wfw_len; o += 4) {
+ 		uint32_t w;
+-		memcpy(&w, s8_wlan_fw + o, 4);
++		memcpy(&w, wfw + o, 4);
+ 		tcm_wr(WLAN_RAMBASE + o, w);
+ 	}
+ 	uint32_t resetintr;
+-	memcpy(&resetintr, s8_wlan_fw, 4);
++	memcpy(&resetintr, wfw, 4);
+ 	tcm_wr(WLAN_RAMBASE + wlan_ramsize - 4, 0);
+-	uint32_t nv = WLAN_RAMBASE + wlan_ramsize - s8_wlan_nvram_size;
+-	for (uint32_t o = 0; o < s8_wlan_nvram_size; o += 4) {
++	uint32_t nv = WLAN_RAMBASE + wlan_ramsize - wnv_len;
++	for (uint32_t o = 0; o < wnv_len; o += 4) {
+ 		uint32_t w;
+-		memcpy(&w, s8_wlan_nvram + o, 4);
++		memcpy(&w, wnv + o, 4);
+ 		tcm_wr(nv + o, w);
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	uint32_t check = tcm_rd(WLAN_RAMBASE + 0x100), want;
+-	memcpy(&want, s8_wlan_fw + 0x100, 4);
+-	LOG("6: %u bytes firmware, %u NVRAM at %#x; readback %s; reset vector %#x", s8_wlan_fw_size,
+-	    s8_wlan_nvram_size, nv, check == want ? "ok" : "MISMATCH", resetintr);
++	memcpy(&want, wfw + 0x100, 4);
++	LOG("6: %u bytes firmware, %u NVRAM at %#x; readback %s; reset vector %#x", wfw_len,
++	    wnv_len, nv, check == want ? "ok" : "MISMATCH", resetintr);
+ 	uint32_t before = tcm_rd(WLAN_RAMBASE + wlan_ramsize - 4);
+ 	/* activate: reset vector at TCM 0, release the ARM (brcmf_chip_cr4_set_active) */
+ 	tcm_wr(0, resetintr);
+@@ -726,17 +786,593 @@ step_firmware(void)
+ 	LOG("6: FIRMWARE RUNNING: shared RAM at %#x, flags %#x (protocol version %u)", wlan_shared, flags,
+ 	    flags & 0xff);
+ 	return 0;
+-#else
+-	LOG("6: no firmware in this build (s8_wlan_fw.h)");
+-	return ENOENT;
+-#endif
++}
++
++/* ---- step 7: the msgbuf protocol (brcmfmac pcie.c, msgbuf.c, commonring.c), all polled ---- */
++
++/* pcie_shared fields (brcmf_pcie_init_share_ram_info) */
++#define SH_MAX_RXBUFPOST        34
++#define SH_RX_DATAOFFSET        36
++#define SH_RING_INFO_ADDR       48
++#define SH_DMA_SCRATCH_LEN      52
++#define SH_DMA_SCRATCH_ADDR     56
++#define SH_DMA_RINGUPD_LEN      64
++#define SH_DMA_RINGUPD_ADDR     68
++#define SH_HOST_CAP             84
++#define SH_HOST_CAP2            96
++#define SH_FLAG_DMA_INDEX       0x10000u
++#define SH_FLAG_HOSTRDY_DB1     0x10000000u
++#define HOSTCAP_H2D_ENABLE_HOSTRDY 0x400u
++#define HOSTCAP_DS_NO_OOB_DW    0x1000u
++
++/* PCIE2 core registers, through the BAR0 window */
++#define PCIE2_MAILBOXINT        0x48
++#define PCIE2_MAILBOXMASK       0x4c
++#define PCIE2_H2D_MAILBOX_0     0x140
++#define PCIE2_H2D_MAILBOX_1     0x144
++
++/* message types (msgbuf.c) */
++#define MT_GEN_STATUS           0x1
++#define MT_RING_STATUS          0x2
++#define MT_IOCTLPTR_REQ         0x9
++#define MT_IOCTLPTR_REQ_ACK     0xa
++#define MT_IOCTLRESP_BUF_POST   0xb
++#define MT_IOCTL_CMPLT          0xc
++#define MT_EVENT_BUF_POST       0xd
++#define MT_WL_EVENT             0xe
++
++#define IOCTL_REQ_PKTID         0xfffe
++#define IOCT_MAX                1518    /* BRCMF_TX_IOCTL_MAX_MSG_SIZE */
++#define CTL_BUF_SIZE            8192    /* BRCMF_MSGBUF_MAX_CTL_PKT_SIZE */
++#define NRESP                   8
++#define NEVENT                  8
++
++/* dongle commands (fwil.h) */
++#define WLC_UP                  2
++#define WLC_SET_INFRA           20
++#define WLC_SET_PM              86
++#define WLC_GET_VAR             262
++#define WLC_SET_VAR             263
++
++struct wring {
++	uint8_t *va;
++	uint64_t pa;
++	uint16_t max, isz, w, r;
++	uint32_t widx, ridx;            /* TCM addresses of the indices */
++};
++
++/* common rings: H2D control submit, H2D rx post, D2H control complete, D2H tx complete, D2H rx complete */
++static const uint16_t ring_max[5] = { 64, 512, 64, 1024, 512 };
++static const uint16_t ring_isz_v7[5] = { 40, 32, 24, 24, 40 };
++static const uint16_t ring_isz_pre7[5] = { 40, 32, 24, 16, 32 };
++static struct wring rings[5];
++#define R_CTRL_SUB      (&rings[0])
++#define R_CTRL_CPL      (&rings[2])
++
++static uint8_t *dma_va;
++static uint64_t dma_pa;
++static uint32_t dma_used, dma_size;
++static uint8_t *ioct_va, *resp_va[NRESP + NEVENT];
++static uint64_t ioct_pa, resp_pa[NRESP + NEVENT];
++static uint32_t rx_dataoffset;
++static uint16_t ioctl_tid;
++static struct bcm_core *pcie2;
++static int wl_version;
++
++static inline uint16_t tcm_rd16(uint32_t o) { return *(volatile uint16_t *)(mem + o); }
++static inline void tcm_wr16(uint32_t o, uint16_t v) { *(volatile uint16_t *)(mem + o) = v; __asm__ volatile ("dsb sy" ::: "memory"); }
++static inline void put16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
++static inline void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
++static inline uint16_t get16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
++static inline uint32_t get32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++static inline uint32_t get32be(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
++
++static void *
++dma_carve(uint32_t size, uint64_t *pa)
++{
++	uint32_t off = (dma_used + 127) & ~127u;
++	if (off + size > dma_size) {
++		return NULL;
++	}
++	dma_used = off + size;
++	*pa = dma_pa + off;
++	return dma_va + off;
++}
++
++static void
++ring_bell(void)
++{
++	bp_wr(pcie2->base + PCIE2_H2D_MAILBOX_0, 1);
++}
++
++/* next free H2D slot, or NULL when the ring is full (brcmf_commonring_reserve_for_write) */
++static uint8_t *
++ring_reserve(struct wring *rg)
++{
++	uint16_t rp = tcm_rd16(rg->ridx);
++	uint16_t avail = rp > rg->w ? rp - rg->w : rg->max - rg->w + rp;
++	if (avail <= 1) {
++		return NULL;
++	}
++	uint8_t *slot = rg->va + (uint32_t)rg->w * rg->isz;
++	bzero(slot, rg->isz);
++	return slot;
++}
++
++static void
++ring_commit(struct wring *rg)
++{
++	uint8_t *slot = rg->va + (uint32_t)rg->w * rg->isz;
++	clean_dcache((vm_offset_t)slot, rg->isz, 0);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	rg->w = (uint16_t)((rg->w + 1) % rg->max);
++	tcm_wr16(rg->widx, rg->w);
++	ring_bell();
++}
++
++static int
++post_buf(uint8_t type, uint32_t id)
++{
++	uint8_t *m = ring_reserve(R_CTRL_SUB);
++	if (m == NULL) {
++		return ENOSPC;
++	}
++	m[0] = type;
++	put32(m + 4, id);                       /* request_id: our buffer number */
++	put16(m + 8, CTL_BUF_SIZE);             /* host_buf_len */
++	put32(m + 16, (uint32_t)resp_pa[id]);   /* host_buf_addr */
++	put32(m + 20, (uint32_t)(resp_pa[id] >> 32));
++	ring_commit(R_CTRL_SUB);
++	return 0;
++}
++
++/* scan results, filled by the event handler */
++#define MAX_NETS 40
++static struct { uint8_t bssid[6]; char ssid[33]; uint16_t chanspec; int16_t rssi; } nets[MAX_NETS];
++static unsigned nnets;
++static int escan_status = -1;           /* -1 running, else the final event status */
++static unsigned nevents;
++
++#define WLC_E_ESCAN_RESULT      69
++#define WLC_E_STATUS_PARTIAL    8
++
++static void
++handle_event(const uint8_t *d, uint32_t len)
++{
++	nevents++;
++	/* ethernet header (14), bcmeth header (10), brcmf_event_msg_be (48), then the data */
++	if (len < 72 || d[12] != 0x88 || d[13] != 0x6c) {
++		return;
++	}
++	const uint8_t *em = d + 24;
++	uint32_t type = get32be(em + 4), status = get32be(em + 8), dlen = get32be(em + 24);
++	const uint8_t *ed = d + 72;
++	if (type != WLC_E_ESCAN_RESULT) {
++		LOG("8: event %u status %u", type, status);
++		return;
++	}
++	if (status != WLC_E_STATUS_PARTIAL) {
++		escan_status = (int)status;
++		return;
++	}
++	/* brcmf_escan_result_le: buflen, version, sync_id, bss_count, then brcmf_bss_info_le */
++	if (dlen < 12 + 80 || 72 + dlen > len) {
++		return;
++	}
++	const uint8_t *bi = ed + 12;
++	unsigned n;
++	for (n = 0; n < nnets && memcmp(nets[n].bssid, bi + 8, 6) != 0; n++) {
++	}
++	if (n == MAX_NETS) {
++		return;
++	}
++	if (n == nnets) {
++		nnets++;
++	}
++	memcpy(nets[n].bssid, bi + 8, 6);
++	uint8_t sl = bi[18] > 32 ? 32 : bi[18];
++	memcpy(nets[n].ssid, bi + 19, sl);
++	nets[n].ssid[sl] = 0;
++	nets[n].chanspec = get16(bi + 72);
++	nets[n].rssi = (int16_t)get16(bi + 78);
++}
++
++/* Drain the control completion ring. Returns the status of the ioctl "tid" when its completion
++ * is seen (and copies its response into out), else 1. */
++static int
++ctrl_poll(uint16_t tid, uint8_t *out, uint32_t outlen, uint32_t *gotlen)
++{
++	struct wring *rg = R_CTRL_CPL;
++	int result = 1;
++	uint16_t w = tcm_rd16(rg->widx);
++	if (w >= rg->max) {
++		return result;
++	}
++	while (rg->r != w) {
++		uint8_t *m = rg->va + (uint32_t)rg->r * rg->isz;
++		flush_dcache((vm_offset_t)m, rg->isz, 0);
++		uint8_t type = m[0];
++		uint32_t id = get32(m + 4);
++		int16_t status = (int16_t)get16(m + 8);
++		switch (type) {
++		case MT_IOCTL_CMPLT: {
++			uint16_t rlen = get16(m + 12), rtid = get16(m + 14);
++			if (id < NRESP) {
++				if (rtid == tid) {
++					uint32_t n = rlen < outlen ? rlen : outlen;
++					flush_dcache((vm_offset_t)resp_va[id], CTL_BUF_SIZE, 0);
++					if (out != NULL) {
++						memcpy(out, resp_va[id], n);
++					}
++					if (gotlen != NULL) {
++						*gotlen = n;
++					}
++					result = status;
++				}
++				post_buf(MT_IOCTLRESP_BUF_POST, id);
++			}
++			break;
++		}
++		case MT_WL_EVENT: {
++			uint16_t elen = get16(m + 12);
++			if (id >= NRESP && id < NRESP + NEVENT) {
++				flush_dcache((vm_offset_t)resp_va[id], CTL_BUF_SIZE, 0);
++				if (rx_dataoffset + elen <= CTL_BUF_SIZE) {
++					handle_event(resp_va[id] + rx_dataoffset, elen);
++				}
++				post_buf(MT_EVENT_BUF_POST, id);
++			}
++			break;
++		}
++		case MT_IOCTLPTR_REQ_ACK:
++			if (status != 0) {
++				LOG("7: ioctl ack status %d", status);
++			}
++			break;
++		default:
++			LOG("7: control completion type %#x status %d", type, status);
++			break;
++		}
++		rg->r = (uint16_t)((rg->r + 1) % rg->max);
++		tcm_wr16(rg->ridx, rg->r);
++	}
++	return result;
++}
++
++/* One dongle ioctl: len bytes of buf in, at most len bytes back into buf. Returns the firmware's status. */
++static int
++wl_ioctl(uint32_t cmd, uint8_t *buf, uint32_t len, uint32_t *gotlen)
++{
++	if (len > IOCT_MAX) {
++		len = IOCT_MAX;
++	}
++	memcpy(ioct_va, buf, len);
++	clean_dcache((vm_offset_t)ioct_va, IOCT_MAX, 0);
++	uint8_t *m = ring_reserve(R_CTRL_SUB);
++	if (m == NULL) {
++		return -1000;
++	}
++	uint16_t tid = ++ioctl_tid;
++	m[0] = MT_IOCTLPTR_REQ;
++	put32(m + 4, IOCTL_REQ_PKTID);
++	put32(m + 8, cmd);
++	put16(m + 12, tid);
++	put16(m + 14, (uint16_t)len);           /* input_buf_len */
++	put16(m + 16, (uint16_t)len);           /* output_buf_len */
++	put32(m + 24, (uint32_t)ioct_pa);       /* req_buf_addr */
++	put32(m + 28, (uint32_t)(ioct_pa >> 32));
++	ring_commit(R_CTRL_SUB);
++	for (int i = 0; i < 2000; i++) {        /* 2 s */
++		int r = ctrl_poll(tid, buf, len, gotlen);
++		if (r != 1) {
++			return r;
++		}
++		IOSleep(1);
++	}
++	return -1001;
++}
++
++static int
++iovar_get(const char *name, uint8_t *out, uint32_t outlen)
++{
++	uint8_t b[IOCT_MAX];
++	uint32_t nl = (uint32_t)strlen(name) + 1, len = outlen > nl ? outlen : nl, got = 0;
++	if (len > IOCT_MAX) {
++		len = IOCT_MAX;
++	}
++	bzero(b, len);
++	memcpy(b, name, nl);
++	int r = wl_ioctl(WLC_GET_VAR, b, len, &got);
++	memcpy(out, b, outlen < len ? outlen : len);
++	return r;
++}
++
++static int
++iovar_set(const char *name, const void *data, uint32_t dlen)
++{
++	uint8_t b[IOCT_MAX];
++	uint32_t nl = (uint32_t)strlen(name) + 1;
++	if (nl + dlen > IOCT_MAX) {
++		return -1002;
++	}
++	memcpy(b, name, nl);
++	memcpy(b + nl, data, dlen);
++	return wl_ioctl(WLC_SET_VAR, b, nl + dlen, NULL);
++}
++
++static int
++cmd_int(uint32_t cmd, uint32_t v)
++{
++	uint8_t b[4];
++	put32(b, v);
++	return wl_ioctl(cmd, b, 4, NULL);
++}
++
++/* "clmload" in 1400-byte chunks (brcmf_c_process_clm_blob) */
++static void
++clm_load(void)
++{
++	if (wclm == NULL) {
++		LOG("7: no CLM blob (ADT s8-wlan-clm): the firmware keeps its built-in regulatory data");
++		return;
++	}
++	uint8_t b[12 + 1400];
++	int r = 0;
++	for (uint32_t off = 0; off < wclm_len && r == 0; off += 1400) {
++		uint32_t n = wclm_len - off > 1400 ? 1400 : wclm_len - off;
++		uint16_t flag = 1u << 12;               /* DLOAD_HANDLER_VER */
++		if (off == 0) {
++			flag |= 0x2;                    /* DL_BEGIN */
++		}
++		if (off + n >= wclm_len) {
++			flag |= 0x4;                    /* DL_END */
++		}
++		put16(b, flag);
++		put16(b + 2, 2);                        /* DL_TYPE_CLM */
++		put32(b + 4, n);
++		put32(b + 8, 0);
++		memcpy(b + 12, wclm + off, n);
++		r = iovar_set("clmload", b, 12 + n);
++	}
++	uint8_t st[4] = { 0 };
++	int r2 = iovar_get("clmload_status", st, 4);
++	LOG("7: CLM blob %u bytes: clmload %d, clmload_status %d/%u", wclm_len, r, r2, get32(st));
++}
++
++/* The firmware's own console (brcmf_pcie_bus_console_read): new text since the last call, line by line. */
++static uint32_t con_ridx;
++
++static void
++fw_console(const char *when)
++{
++	uint32_t c = tcm_rd(wlan_shared + 20);
++	if (c < WLAN_RAMBASE || c >= WLAN_RAMBASE + wlan_ramsize) {
++		return;
++	}
++	uint32_t buf = tcm_rd(c + 8), size = tcm_rd(c + 12), widx = tcm_rd(c + 16);
++	if (size == 0 || size > 0x10000 || widx >= size || buf < WLAN_RAMBASE || buf + size > WLAN_RAMBASE + wlan_ramsize) {
++		return;
++	}
++	char line[161];
++	unsigned n = 0, total = 0;
++	LOG("fw console (%s):", when);
++	while (con_ridx != widx && total < 6000) {
++		uint32_t w = tcm_rd(buf + (con_ridx & ~3u));
++		char ch = (char)(w >> (8 * (con_ridx & 3)));
++		con_ridx = (con_ridx + 1) % size;
++		total++;
++		if (ch == '\r') {
++			continue;
++		}
++		if (ch == '\n' || n == sizeof(line) - 1) {
++			line[n] = 0;
++			if (n) {
++				LOG("fw: %s", line);
++			}
++			n = 0;
++			if (ch == '\n') {
++				continue;
++			}
++		}
++		line[n++] = (ch >= 0x20 && ch < 0x7f) ? ch : '.';
++	}
++	if (n) {
++		line[n] = 0;
++		LOG("fw: %s", line);
++	}
++}
++
++static int
++step_msgbuf(void)
++{
++	uint32_t sh = wlan_shared, flags = tcm_rd(sh);
++	wl_version = flags & 0xff;
++	if (wl_version < 5 || wl_version > 7) {
++		LOG("7: unsupported protocol version %d", wl_version);
++		return ENOTSUP;
++	}
++	if (flags & SH_FLAG_DMA_INDEX) {
++		LOG("7: firmware wants ring indices in host memory (flags %#x): not supported", flags);
++		return ENOTSUP;
++	}
++	pcie2 = core_find(CORE_PCIE2, 0);
++	if (pcie2 == NULL) {
++		LOG("7: no PCIE2 core");
++		return ENODEV;
++	}
++	rx_dataoffset = tcm_rd(sh + SH_RX_DATAOFFSET);
++	uint32_t ri = tcm_rd(sh + SH_RING_INFO_ADDR);
++	uint32_t ringmem = tcm_rd(ri), h2dw = tcm_rd(ri + 4), h2dr = tcm_rd(ri + 8), d2hw = tcm_rd(ri + 12),
++	    d2hr = tcm_rd(ri + 16);
++	LOG("7: version %d, max rxbufpost %u, rx data offset %u, ring info %#x (ringmem %#x, %u flow / %u sub / %u cpl rings)",
++	    wl_version, tcm_rd16(sh + SH_MAX_RXBUFPOST), rx_dataoffset, ri, ringmem, tcm_rd16(ri + 52),
++	    tcm_rd16(ri + 54), tcm_rd16(ri + 56));
++	if (rx_dataoffset >= CTL_BUF_SIZE / 2) {
++		return EINVAL;
++	}
++	/* host memory: rings, scratch, ring update, ioctl request and the response/event buffers */
++	dma_size = 256 * 1024;
++	vm_offset_t va = 0;
++	if (kmem_alloc_contig(kernel_map, &va, dma_size, PAGE_MASK, 0, 0, KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		LOG("7: no contiguous memory");
++		return ENOMEM;
++	}
++	dma_va = (uint8_t *)va;
++	dma_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va));
++	clean_dcache(va, dma_size, 0);
++	const uint16_t *isz = wl_version >= 7 ? ring_isz_v7 : ring_isz_pre7;
++	for (int i = 0; i < 5; i++) {
++		struct wring *rg = &rings[i];
++		rg->max = ring_max[i];
++		rg->isz = isz[i];
++		rg->va = dma_carve((uint32_t)rg->max * rg->isz, &rg->pa);
++		if (rg->va == NULL) {
++			return ENOMEM;
++		}
++		if (i < 2) {
++			rg->widx = h2dw + 4 * i;
++			rg->ridx = h2dr + 4 * i;
++		} else {
++			rg->widx = d2hw + 4 * (i - 2);
++			rg->ridx = d2hr + 4 * (i - 2);
++		}
++		uint32_t d = ringmem + 16 * i;
++		tcm_wr16(d + 4, rg->max);
++		tcm_wr16(d + 6, rg->isz);
++		tcm_wr(d + 8, (uint32_t)rg->pa);
++		tcm_wr(d + 12, (uint32_t)(rg->pa >> 32));
++		rg->w = rg->r = 0;
++	}
++	uint64_t spa, upa;
++	if (dma_carve(8, &spa) == NULL || dma_carve(1024, &upa) == NULL ||
++	    (ioct_va = dma_carve(IOCT_MAX, &ioct_pa)) == NULL) {
++		return ENOMEM;
++	}
++	for (int i = 0; i < NRESP + NEVENT; i++) {
++		if ((resp_va[i] = dma_carve(CTL_BUF_SIZE, &resp_pa[i])) == NULL) {
++			return ENOMEM;
++		}
++	}
++	tcm_wr(sh + SH_DMA_SCRATCH_ADDR, (uint32_t)spa);
++	tcm_wr(sh + SH_DMA_SCRATCH_ADDR + 4, (uint32_t)(spa >> 32));
++	tcm_wr(sh + SH_DMA_SCRATCH_LEN, 8);
++	tcm_wr(sh + SH_DMA_RINGUPD_ADDR, (uint32_t)upa);
++	tcm_wr(sh + SH_DMA_RINGUPD_ADDR + 4, (uint32_t)(upa >> 32));
++	tcm_wr(sh + SH_DMA_RINGUPD_LEN, 1024);
++	if (wl_version >= 6) {
++		uint32_t cap = (uint32_t)wl_version | HOSTCAP_DS_NO_OOB_DW;
++		if (flags & SH_FLAG_HOSTRDY_DB1) {
++			cap |= HOSTCAP_H2D_ENABLE_HOSTRDY;
++		}
++		tcm_wr(sh + SH_HOST_CAP, cap);
++		tcm_wr(sh + SH_HOST_CAP2, 0);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	LOG("7: host memory %#llx..%#llx (%u bytes used), rings at %#llx", dma_pa, dma_pa + dma_size, dma_used,
++	    rings[0].pa);
++	/* polled: interrupts masked, pending ones cleared */
++	bp_wr(pcie2->base + PCIE2_MAILBOXMASK, 0);
++	bp_wr(pcie2->base + PCIE2_MAILBOXINT, bp_rd(pcie2->base + PCIE2_MAILBOXINT));
++	if (flags & SH_FLAG_HOSTRDY_DB1) {
++		bp_wr(pcie2->base + PCIE2_H2D_MAILBOX_1, 1);    /* brcmf_pcie_hostready */
++	}
++	for (uint32_t i = 0; i < NRESP; i++) {
++		post_buf(MT_IOCTLRESP_BUF_POST, i);
++	}
++	for (uint32_t i = NRESP; i < NRESP + NEVENT; i++) {
++		post_buf(MT_EVENT_BUF_POST, i);
++	}
++	IOSleep(20);
++	(void)ctrl_poll(0, NULL, 0, NULL);
++	LOG("7: control rings: submit w %u r %u, complete w %u", R_CTRL_SUB->w, tcm_rd16(R_CTRL_SUB->ridx),
++	    tcm_rd16(R_CTRL_CPL->widx));
++
++	char ver[257];
++	bzero(ver, sizeof(ver));
++	int r = iovar_get("ver", (uint8_t *)ver, 256);
++	for (int i = 0; ver[i]; i++) {
++		if (ver[i] == '\n' || ver[i] == '\r') {
++			ver[i] = ' ';
++		}
++	}
++	LOG("7: ver: %d \"%s\"", r, ver);
++	if (r != 0) {
++		fw_console("ver failed");
++		return EIO;
++	}
++	uint8_t mac[6] = { 0 };
++	r = iovar_get("cur_etheraddr", mac, 6);
++	LOG("7: MAC %02x:%02x:%02x:%02x:%02x:%02x (%d)", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], r);
++	clm_load();
++	fw_console("after step 7");
++	LOG("7: MSGBUF UP");
++	return 0;
++}
++
++static int
++step_scan(void)
++{
++	uint8_t mask[18] = { 0 };
++	int r = iovar_get("event_msgs", mask, sizeof(mask));
++	mask[WLC_E_ESCAN_RESULT / 8] |= 1u << (WLC_E_ESCAN_RESULT % 8);
++	int r2 = iovar_set("event_msgs", mask, sizeof(mask));
++	int r3 = iovar_set("mpc", (const uint8_t[]){ 0, 0, 0, 0 }, 4);
++	int r4 = cmd_int(WLC_SET_INFRA, 1);
++	int r5 = cmd_int(WLC_SET_PM, 0);
++	int r6 = cmd_int(WLC_UP, 1);
++	LOG("8: event_msgs %d/%d, mpc 0 %d, infra %d, pm %d, up %d", r, r2, r3, r4, r5, r6);
++	if (r6 != 0) {
++		fw_console("up failed");
++		return EIO;
++	}
++	/* brcmf_escan_params_le v1: version, action START, sync id, then brcmf_scan_params_le
++	 * (any SSID, broadcast BSSID, any BSS type, active, firmware defaults, all channels) */
++	uint8_t p[8 + 64];
++	bzero(p, sizeof(p));
++	put32(p, 1);
++	put16(p + 4, 1);
++	put16(p + 6, 0x5338);
++	uint8_t *sp = p + 8;
++	memset(sp + 36, 0xff, 6);
++	sp[42] = 2;
++	sp[43] = 0;
++	put32(sp + 44, 0xffffffffu);
++	put32(sp + 48, 0xffffffffu);
++	put32(sp + 52, 0xffffffffu);
++	put32(sp + 56, 0xffffffffu);
++	put32(sp + 60, 0);
++	nnets = 0;
++	nevents = 0;
++	escan_status = -1;
++	r = iovar_set("escan", p, sizeof(p));
++	LOG("8: escan %d", r);
++	if (r != 0) {
++		fw_console("escan failed");
++		return EIO;
++	}
++	for (int i = 0; i < 1500 && escan_status < 0; i++) {   /* 15 s */
++		(void)ctrl_poll(0, NULL, 0, NULL);
++		IOSleep(10);
++	}
++	fw_console("after the scan");
++	LOG("8: scan %s (status %d), %u events, %u networks", escan_status == 0 ? "done" :
++	    escan_status < 0 ? "TIMED OUT" : "ended", escan_status, nevents, nnets);
++	for (unsigned i = 0; i < nnets; i++) {
++		uint16_t cs = nets[i].chanspec;
++		LOG("8: NET %2u ch %3u%s %4d dBm %02x:%02x:%02x:%02x:%02x:%02x \"%s\"", i + 1, cs & 0xff,
++		    (cs & 0xc000) == 0xc000 ? " 5G" : "   ", nets[i].rssi, nets[i].bssid[0], nets[i].bssid[1],
++		    nets[i].bssid[2], nets[i].bssid[3], nets[i].bssid[4], nets[i].bssid[5], nets[i].ssid);
++	}
++	return nnets ? 0 : ENOENT;
+ }
+ 
+ static void
+ s8_wlan_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
+-	static int (*const steps[])(void) = { step_survey, step_power, step_link, step_config, step_bars, step_firmware };
+-	static const char *const names[] = { "survey", "power", "link", "config", "bars", "firmware" };
++	static int (*const steps[])(void) = { step_survey, step_power, step_link, step_config, step_bars, step_firmware,
++		                              step_msgbuf, step_scan };
++	static const char *const names[] = { "survey", "power", "link", "config", "bars", "firmware", "msgbuf", "scan" };
+ 
+ 	elbi = (volatile uint8_t *)ml_io_map(ELBI_PA, 0x1000);
+ 	pcs = (volatile uint8_t *)ml_io_map(PCS_PA, 0x1000);
