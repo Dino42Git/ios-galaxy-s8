@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/s8_wlan.c b/bsd/dev/s8_wlan.c
+index 15f9b3f..dae223d 100644
+--- a/bsd/dev/s8_wlan.c
++++ b/bsd/dev/s8_wlan.c
+@@ -849,10 +849,12 @@ step_firmware(void)
+ 	}
+ 	LOG("6: image readback: %u bad words (first at +%#x); free RAM %#x..%#x set to a5a5a5a5", bad, first_bad,
+ 	    free_lo, free_hi);
+-	struct bcm_core *cc = core_find(0x800, 0);
++	/* PMU registers live in the separate PMU core (0x827) on this chip: chipcommon + 0x608
++	 * hung the bus (0156: endless resets) */
++	struct bcm_core *cc = core_find(0x800, 0), *pmuc = core_find(0x827, 0);
+ 	LOG("6: before start: cr4 ioctl %#x resetctl %#x, chipcommon clk_ctl_st %#x pmustatus %#x",
+ 	    bp_rd(cr4->wrap + BCMA_IOCTL), bp_rd(cr4->wrap + BCMA_RESET_CTL), cc ? bp_rd(cc->base + 0x1e0) : 0,
+-	    cc ? bp_rd(cc->base + 0x608) : 0);
++	    pmuc ? bp_rd(pmuc->base + 0x608) : 0);
+ 	uint32_t before = tcm_rd(WLAN_RAMBASE + wlan_ramsize - 4);
+ 	/* activate: reset vector at TCM 0, release the ARM (brcmf_chip_cr4_set_active) */
+ 	tcm_wr(0, resetintr);
+@@ -889,7 +891,7 @@ step_firmware(void)
+ 		    changed, first_ch, last_ch, img_changed, tcm_rd(0));
+ 		LOG("6: after 5 s: cr4 ioctl %#x resetctl %#x, chipcommon clk_ctl_st %#x pmustatus %#x",
+ 		    bp_rd(cr4->wrap + BCMA_IOCTL), bp_rd(cr4->wrap + BCMA_RESET_CTL), cc ? bp_rd(cc->base + 0x1e0) : 0,
+-		    cc ? bp_rd(cc->base + 0x608) : 0);
++		    pmuc ? bp_rd(pmuc->base + 0x608) : 0);
+ 		tcm_text(WLAN_RAMBASE + wfw_len, WLAN_RAMBASE + wlan_ramsize - wnv_len);
+ 		return ETIMEDOUT;
+ 	}
