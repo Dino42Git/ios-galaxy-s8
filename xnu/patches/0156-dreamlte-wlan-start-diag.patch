@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/s8_wlan.c b/bsd/dev/s8_wlan.c
+index 526fcb7..15f9b3f 100644
+--- a/bsd/dev/s8_wlan.c
++++ b/bsd/dev/s8_wlan.c
+@@ -833,10 +833,32 @@ step_firmware(void)
+ 	memcpy(&want, wfw + 0x100, 4);
+ 	LOG("6: %u bytes firmware, %u NVRAM at %#x; readback %s; reset vector %#x", wfw_len,
+ 	    wnv_len, nv, check == want ? "ok" : "MISMATCH", resetintr);
++	/* diagnostics (0156): whole image read back; the free RAM between the image and the NVRAM
++	 * filled with a pattern, to see whether the ARM runs at all (its startup clears its BSS) */
++	uint32_t bad = 0, first_bad = 0;
++	for (uint32_t o = 0; o < wfw_len; o += 4) {
++		uint32_t w;
++		memcpy(&w, wfw + o, 4);
++		if (tcm_rd(WLAN_RAMBASE + o) != w && bad++ == 0) {
++			first_bad = o;
++		}
++	}
++	uint32_t free_lo = WLAN_RAMBASE + wfw_len, free_hi = nv;
++	for (uint32_t a = free_lo; a < free_hi; a += 4) {
++		tcm_wr(a, 0xa5a5a5a5u);
++	}
++	LOG("6: image readback: %u bad words (first at +%#x); free RAM %#x..%#x set to a5a5a5a5", bad, first_bad,
++	    free_lo, free_hi);
++	struct bcm_core *cc = core_find(0x800, 0);
++	LOG("6: before start: cr4 ioctl %#x resetctl %#x, chipcommon clk_ctl_st %#x pmustatus %#x",
++	    bp_rd(cr4->wrap + BCMA_IOCTL), bp_rd(cr4->wrap + BCMA_RESET_CTL), cc ? bp_rd(cc->base + 0x1e0) : 0,
++	    cc ? bp_rd(cc->base + 0x608) : 0);
+ 	uint32_t before = tcm_rd(WLAN_RAMBASE + wlan_ramsize - 4);
+ 	/* activate: reset vector at TCM 0, release the ARM (brcmf_chip_cr4_set_active) */
+ 	tcm_wr(0, resetintr);
+ 	core_reset(cr4, CR4_CPUHALT, 0, 0);
++	LOG("6: ARM released: cr4 ioctl %#x resetctl %#x", bp_rd(cr4->wrap + BCMA_IOCTL),
++	    bp_rd(cr4->wrap + BCMA_RESET_CTL));
+ 	for (int i = 0; i < 100; i++) {                 /* 5 s */
+ 		IOSleep(50);
+ 		wlan_shared = tcm_rd(WLAN_RAMBASE + wlan_ramsize - 4);
+@@ -846,6 +868,28 @@ step_firmware(void)
+ 	}
+ 	if (wlan_shared == before || wlan_shared < WLAN_RAMBASE || wlan_shared >= WLAN_RAMBASE + wlan_ramsize) {
+ 		LOG("6: firmware did not start (shared %#x)", wlan_shared);
++		uint32_t changed = 0, first_ch = 0, last_ch = 0;
++		for (uint32_t a = free_lo; a < free_hi; a += 4) {
++			if (tcm_rd(a) != 0xa5a5a5a5u) {
++				if (changed++ == 0) {
++					first_ch = a;
++				}
++				last_ch = a;
++			}
++		}
++		uint32_t img_changed = 0;
++		for (uint32_t o = 0; o < wfw_len; o += 4) {
++			uint32_t w;
++			memcpy(&w, wfw + o, 4);
++			if (tcm_rd(WLAN_RAMBASE + o) != w) {
++				img_changed++;
++			}
++		}
++		LOG("6: after 5 s: %u free-RAM words changed (%#x..%#x), %u image words changed; TCM 0 %#x",
++		    changed, first_ch, last_ch, img_changed, tcm_rd(0));
++		LOG("6: after 5 s: cr4 ioctl %#x resetctl %#x, chipcommon clk_ctl_st %#x pmustatus %#x",
++		    bp_rd(cr4->wrap + BCMA_IOCTL), bp_rd(cr4->wrap + BCMA_RESET_CTL), cc ? bp_rd(cc->base + 0x1e0) : 0,
++		    cc ? bp_rd(cc->base + 0x608) : 0);
+ 		tcm_text(WLAN_RAMBASE + wfw_len, WLAN_RAMBASE + wlan_ramsize - wnv_len);
+ 		return ETIMEDOUT;
+ 	}
