@@ -1,0 +1,40 @@
+diff --git a/bsd/dev/s8_wlan.c b/bsd/dev/s8_wlan.c
+index ff9b87f..34fb6e1 100644
+--- a/bsd/dev/s8_wlan.c
++++ b/bsd/dev/s8_wlan.c
+@@ -1388,6 +1388,25 @@ step_scan(void)
+ 	return nnets ? 0 : ENOENT;
+ }
+ 
++/*
++ * After a failed step 6 or later the chip must not be left running: its ARM may execute a
++ * wrong firmware with bus mastering on and write anywhere in RAM (one boot crashed later,
++ * the next ones reset before the Apple logo). Halt the ARM, turn bus mastering off,
++ * assert PERST# and drop WLAN_REG_ON.
++ */
++static void
++wlan_power_off(void)
++{
++	struct bcm_core *cr4 = core_find(CORE_ARM_CR4, 0);
++	if (cr4 != NULL) {
++		core_disable(cr4, CR4_CPUHALT, CR4_CPUHALT);
++	}
++	ep_cfg_wr(0x04, ep_cfg_rd(0x04) & ~0x0006u);
++	perst(true);
++	set(gpj1, 0x4, 1u << 3, 0);
++	LOG("chip stopped: ARM halted, bus master off, PERST# asserted, WLAN_REG_ON off (gpj1 dat %#x)", rd(gpj1, 4));
++}
++
+ static void
+ s8_wlan_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
+@@ -1410,6 +1429,9 @@ s8_wlan_thread(__unused void *arg, __unused wait_result_t wr_)
+ 		int error = steps[i]();
+ 		if (error) {
+ 			LOG("step %u (%s) failed: %d, stopping", i + 1, names[i], error);
++			if (i >= 5) {
++				wlan_power_off();
++			}
+ 			break;
+ 		}
+ 	}
