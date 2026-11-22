@@ -1,0 +1,76 @@
+diff --git a/bsd/dev/s8_wlan.c b/bsd/dev/s8_wlan.c
+index 34fb6e1..526fcb7 100644
+--- a/bsd/dev/s8_wlan.c
++++ b/bsd/dev/s8_wlan.c
+@@ -732,6 +732,42 @@ fw_find(void)
+ 	wclm = adt_blob(chosen, "s8-wlan-clm", &wclm_len);
+ }
+ 
++/* After a failed start: the printable text the firmware wrote between its image and the NVRAM
++ * (console buffer, trap or assert messages), as runs of at least 12 characters. */
++static void
++tcm_text(uint32_t from, uint32_t to)
++{
++	char run[121];
++	unsigned n = 0, runs = 0;
++	uint32_t start = 0;
++	LOG("6: text in TCM %#x..%#x:", from, to);
++	for (uint32_t a = from & ~3u; a < to && runs < 80; a += 4) {
++		uint32_t w = tcm_rd(a);
++		for (int b = 0; b < 4; b++) {
++			char ch = (char)(w >> (8 * b));
++			bool pr = (ch >= 0x20 && ch < 0x7f) || ch == '\n';
++			if (pr && n < sizeof(run) - 1) {
++				if (n == 0) {
++					start = a + (uint32_t)b;
++				}
++				run[n++] = ch == '\n' ? '|' : ch;
++				continue;
++			}
++			if (n >= 12) {
++				run[n] = 0;
++				LOG("6: %#x: %s", start, run);
++				runs++;
++			}
++			n = 0;
++			if (pr) {
++				start = a + (uint32_t)b;
++				run[n++] = ch == '\n' ? '|' : ch;
++			}
++		}
++	}
++	LOG("6: %u text runs", runs);
++}
++
+ static int
+ step_firmware(void)
+ {
+@@ -747,9 +783,18 @@ step_firmware(void)
+ 	/* halt the ARM (brcmf_chip_disable_arm), disable the D11 cores */
+ 	uint32_t ioctl = bp_rd(cr4->wrap + BCMA_IOCTL) & CR4_CPUHALT;
+ 	core_reset(cr4, ioctl, CR4_CPUHALT, CR4_CPUHALT);
+-	for (unsigned n = 0; core_find(CORE_80211, n) != NULL; n++) {
+-		core_disable(core_find(CORE_80211, n), D11_PHYRESET | D11_PHYCLOCKEN, D11_PHYCLOCKEN);
++	/* brcmf_chip_cr4_set_passive: the first D11 core is reset with its PHY clock on (not left
++	 * disabled); boot-arg s8wlan_d11=0 keeps the old behaviour (every D11 core disabled). */
++	uint32_t d11_reset = 1;
++	PE_parse_boot_argn("s8wlan_d11", &d11_reset, sizeof(d11_reset));
++	if (d11_reset && core_find(CORE_80211, 0) != NULL) {
++		core_reset(core_find(CORE_80211, 0), D11_PHYRESET | D11_PHYCLOCKEN, D11_PHYCLOCKEN, D11_PHYCLOCKEN);
++	} else {
++		for (unsigned n = 0; core_find(CORE_80211, n) != NULL; n++) {
++			core_disable(core_find(CORE_80211, n), D11_PHYRESET | D11_PHYCLOCKEN, D11_PHYCLOCKEN);
++		}
+ 	}
++	LOG("6: D11 %s", d11_reset ? "reset, PHY clock on (as brcmfmac)" : "cores disabled");
+ 	/* TCM size (brcmf_chip_tcm_ramsize) */
+ 	uint32_t cap = bp_rd(cr4->base + 0x04), banks = (cap & 0xf) + ((cap >> 4) & 0xf);
+ 	wlan_ramsize = 0;
+@@ -801,6 +846,7 @@ step_firmware(void)
+ 	}
+ 	if (wlan_shared == before || wlan_shared < WLAN_RAMBASE || wlan_shared >= WLAN_RAMBASE + wlan_ramsize) {
+ 		LOG("6: firmware did not start (shared %#x)", wlan_shared);
++		tcm_text(WLAN_RAMBASE + wfw_len, WLAN_RAMBASE + wlan_ramsize - wnv_len);
+ 		return ETIMEDOUT;
+ 	}
+ 	uint32_t flags = tcm_rd(wlan_shared);           /* struct brcmf_pcie_shared_info: flags first */
