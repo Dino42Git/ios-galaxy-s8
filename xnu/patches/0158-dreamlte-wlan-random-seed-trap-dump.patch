@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/s8_wlan.c b/bsd/dev/s8_wlan.c
+index dae223d..93c4eca 100644
+--- a/bsd/dev/s8_wlan.c
++++ b/bsd/dev/s8_wlan.c
+@@ -45,6 +45,7 @@
+ #include <libkern/libkern.h>
+ #include <pexpert/arm64/board_config.h>
+ #include <pexpert/device_tree.h>
++#include <sys/random.h>
+ #include <vm/vm_kern.h>
+ #include <vm/pmap.h>
+ #if __has_include("s8_wlan_fw.h")
+@@ -843,7 +844,20 @@ step_firmware(void)
+ 			first_bad = o;
+ 		}
+ 	}
+-	uint32_t free_lo = WLAN_RAMBASE + wfw_len, free_hi = nv;
++	/* 0158: random seed below the NVRAM, as brcmfmac (BRCMF_RANDOM_SEED_*) and Samsung's
++	 * dhdpcie_wrt_rnd(): 256 random bytes, then { length, magic 0xfeedc0de }. The firmware
++	 * has the magic; without the footer it read the a5a5a5a5 fill (or stale RAM) instead. */
++	uint32_t seed_at = nv - 8 - 0x100;
++	{
++		uint32_t rnd[64];
++		read_random(rnd, sizeof(rnd));
++		for (unsigned i = 0; i < 64; i++) {
++			tcm_wr(seed_at + 4 * i, rnd[i]);
++		}
++		tcm_wr(nv - 8, 0x100);
++		tcm_wr(nv - 4, 0xfeedc0deu);
++	}
++	uint32_t free_lo = WLAN_RAMBASE + wfw_len, free_hi = seed_at;
+ 	for (uint32_t a = free_lo; a < free_hi; a += 4) {
+ 		tcm_wr(a, 0xa5a5a5a5u);
+ 	}
+@@ -889,6 +903,17 @@ step_firmware(void)
+ 		}
+ 		LOG("6: after 5 s: %u free-RAM words changed (%#x..%#x), %u image words changed; TCM 0 %#x",
+ 		    changed, first_ch, last_ch, img_changed, tcm_rd(0));
++		/* 0158: the changed free-RAM words (an ARM trap record or the stack), 8 per line */
++		if (changed) {
++			uint32_t lo = (first_ch & ~0x1fu) - 0x20, hi = (last_ch | 0x1fu) + 1 + 0x20;
++			if (hi - lo > 0x400) {
++				hi = lo + 0x400;
++			}
++			for (uint32_t a = lo; a < hi; a += 32) {
++				LOG("6: dump %#x: %08x %08x %08x %08x %08x %08x %08x %08x", a, tcm_rd(a), tcm_rd(a + 4),
++				    tcm_rd(a + 8), tcm_rd(a + 12), tcm_rd(a + 16), tcm_rd(a + 20), tcm_rd(a + 24), tcm_rd(a + 28));
++			}
++		}
+ 		LOG("6: after 5 s: cr4 ioctl %#x resetctl %#x, chipcommon clk_ctl_st %#x pmustatus %#x",
+ 		    bp_rd(cr4->wrap + BCMA_IOCTL), bp_rd(cr4->wrap + BCMA_RESET_CTL), cc ? bp_rd(cc->base + 0x1e0) : 0,
+ 		    pmuc ? bp_rd(pmuc->base + 0x608) : 0);
