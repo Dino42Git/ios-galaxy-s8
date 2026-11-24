@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/s8_wlan.c b/bsd/dev/s8_wlan.c
+index 93c4eca..ad600e4 100644
+--- a/bsd/dev/s8_wlan.c
++++ b/bsd/dev/s8_wlan.c
+@@ -914,6 +914,47 @@ step_firmware(void)
+ 				    tcm_rd(a + 8), tcm_rd(a + 12), tcm_rd(a + 16), tcm_rd(a + 20), tcm_rd(a + 24), tcm_rd(a + 28));
+ 			}
+ 		}
++		/* 0159: the console is inside the image (data/bss): text in the image words that changed */
++		{
++			char run[121];
++			unsigned n = 0, runs = 0;
++			uint32_t start = 0;
++			for (uint32_t o = 0; o < wfw_len && runs < 120; o += 4) {
++				uint32_t w = tcm_rd(WLAN_RAMBASE + o), orig;
++				memcpy(&orig, wfw + o, 4);
++				for (int b = 0; b < 4; b++) {
++					char ch = (char)(w >> (8 * b));
++					bool pr = w != orig && ((ch >= 0x20 && ch < 0x7f) || ch == '\n');
++					if (pr && n < sizeof(run) - 1) {
++						if (n == 0) {
++							start = WLAN_RAMBASE + o + (uint32_t)b;
++						}
++						run[n++] = ch == '\n' ? '|' : ch;
++						continue;
++					}
++					if (n >= 8) {
++						run[n] = 0;
++						LOG("6: con %#x: %s", start, run);
++						runs++;
++					}
++					n = 0;
++				}
++			}
++			LOG("6: %u console runs in the image", runs);
++		}
++		/* 0159: the code around the trap's epc as the ARM sees it now (trap record: type, epc, ...) */
++		if (changed) {
++			uint32_t epc = tcm_rd(first_ch + 4);
++			if (epc >= WLAN_RAMBASE + 0x20 && epc < WLAN_RAMBASE + wfw_len - 0x20) {
++				uint32_t a = (epc & ~3u) - 0x10;
++				for (int k = 0; k < 2; k++, a += 16) {
++					uint32_t o = a - WLAN_RAMBASE, f[4];
++					memcpy(f, wfw + o, 16);
++					LOG("6: epc area %#x: now %08x %08x %08x %08x file %08x %08x %08x %08x", a, tcm_rd(a),
++					    tcm_rd(a + 4), tcm_rd(a + 8), tcm_rd(a + 12), f[0], f[1], f[2], f[3]);
++				}
++			}
++		}
+ 		LOG("6: after 5 s: cr4 ioctl %#x resetctl %#x, chipcommon clk_ctl_st %#x pmustatus %#x",
+ 		    bp_rd(cr4->wrap + BCMA_IOCTL), bp_rd(cr4->wrap + BCMA_RESET_CTL), cc ? bp_rd(cc->base + 0x1e0) : 0,
+ 		    pmuc ? bp_rd(pmuc->base + 0x608) : 0);
