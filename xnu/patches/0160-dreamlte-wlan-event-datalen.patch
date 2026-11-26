@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/s8_wlan.c b/bsd/dev/s8_wlan.c
+index ad600e4..a8c7b40 100644
+--- a/bsd/dev/s8_wlan.c
++++ b/bsd/dev/s8_wlan.c
+@@ -1124,7 +1124,7 @@ handle_event(const uint8_t *d, uint32_t len)
+ 		return;
+ 	}
+ 	const uint8_t *em = d + 24;
+-	uint32_t type = get32be(em + 4), status = get32be(em + 8), dlen = get32be(em + 24);
++	uint32_t type = get32be(em + 4), status = get32be(em + 8), dlen = get32be(em + 20);	/* datalen (0160: was +24) */
+ 	const uint8_t *ed = d + 72;
+ 	if (type != WLC_E_ESCAN_RESULT) {
+ 		LOG("8: event %u status %u", type, status);
+@@ -1136,6 +1136,7 @@ handle_event(const uint8_t *d, uint32_t len)
+ 	}
+ 	/* brcmf_escan_result_le: buflen, version, sync_id, bss_count, then brcmf_bss_info_le */
+ 	if (dlen < 12 + 80 || 72 + dlen > len) {
++		LOG("8: escan result skipped: datalen %u, packet %u", dlen, len);
+ 		return;
+ 	}
+ 	const uint8_t *bi = ed + 12;
